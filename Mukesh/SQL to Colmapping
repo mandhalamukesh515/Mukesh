@@ -1,0 +1,979 @@
+import re
+import pandas as pd
+import sqlglot
+from sqlglot import exp
+from sqlglot import ErrorLevel
+
+
+# =====================================================
+# CONFIG
+# =====================================================
+INPUT_FILE = r"C:\Users\mandh\Documents\CBU\SQL Automation test\SQL Automation test\SQL_2_col_map inp - rem mini.xlsx"
+OUTPUT_FILE = r"C:\Users\mandh\Documents\CBU\SQL Automation test\SQL Automation test\SQL_2_col_map out_v8_clean_rem mini out.xlsx"
+
+
+# =====================================================
+# DATASOURCE → SQL DIALECT
+# =====================================================
+def get_dialect_from_datasource(datasource):
+    ds = str(datasource).strip().lower()
+
+    if "singlestore" in ds:
+        return "mysql"
+    if "teradata" in ds:
+        return "teradata"
+    if "oracle" in ds:
+        return "oracle"
+    if "zira-oracle" in ds:
+        return "oracle"
+    if "vend connection-oracle" in ds:
+        return "oracle"
+    if "brp" in ds:
+        return "oracle"
+    if "trino" in ds:
+        return "trino"
+    if "mssql" in ds or "sql server" in ds or "sqlserver" in ds:
+        return "tsql"
+    if "bigdata" in ds or "big data" in ds:
+        return "spark"
+    if "tibco" in ds:
+        return None
+
+    return None
+
+
+COL_PROJECT_NAME = "Project Name"
+COL_PROJECT_ID = "Project ID"
+COL_OBJECT_ID = "Ltable ID"
+COL_COLUMN_NAME = "columnName"
+COL_COLUMN_ID = "ColumnId"
+COL_SQL_QUERY = "SQL Query"
+COL_DATASOURCE = "Datasource"
+
+GROUP_COLUMNS = [COL_PROJECT_ID, COL_OBJECT_ID, COL_DATASOURCE]
+
+
+# =====================================================
+# HELPERS
+# =====================================================
+def clean_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def normalize_sql(sql):
+    sql = clean_text(sql)
+    sql = sql.replace("\r", " ").replace("\n", " ")
+    sql = re.sub(r"\s+", " ", sql)
+    return sql.strip()
+
+
+def normalize_name(name):
+    name = clean_text(name)
+    name = name.replace('"', "")
+    name = name.replace("'", "")
+    name = name.replace("[", "").replace("]", "")
+    name = name.replace("`", "")
+    return name.strip().upper()
+
+
+def unique_keep_order(items):
+    seen = set()
+    result = []
+
+    for item in items:
+        if not item:
+            continue
+
+        item = str(item).strip()
+        if not item:
+            continue
+
+        key = item.upper()
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+
+    return result
+
+
+def expr_to_sql(expression, dialect=None):
+    try:
+        return expression.sql()
+    except Exception:
+        return str(expression)
+
+def preprocess_sql(sql):
+    sql = clean_text(sql)
+
+    # remove comments
+    sql = re.sub(r"--.*?(\n|$)", " ", sql)
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+
+    # normalize spaces
+    sql = sql.replace("\r", " ").replace("\n", " ")
+    sql = re.sub(r"\s+", " ", sql).strip()
+
+    # Teradata SEL shorthand
+    if re.match(r"^SEL\s+", sql, flags=re.IGNORECASE):
+        sql = re.sub(r"^SEL\s+", "SELECT ", sql, flags=re.IGNORECASE)
+
+    # remove ending semicolon
+    sql = sql.rstrip(";")
+
+    return sql
+
+def parse_sql(sql, datasource):
+    dialect = get_dialect_from_datasource(datasource)
+
+    # First try datasource dialect
+    if dialect:
+        try:
+            return sqlglot.parse_one(sql, read=dialect), dialect
+        except Exception:
+            pass
+
+    # Then try generic
+    try:
+        return sqlglot.parse_one(sql), "generic"
+    except Exception:
+        return None, dialect or "generic"
+
+
+# =====================================================
+# TABLE / SUBQUERY ALIAS MAP
+# =====================================================
+def get_clean_table_name(table_expr):
+    """
+    Returns clean physical table name without alias.
+    Example:
+    dp_jira_vew.vw_jiraissue AS ji -> dp_jira_vew.vw_jiraissue
+    """
+    parts = []
+
+    if table_expr.catalog:
+        parts.append(str(table_expr.catalog))
+
+    if table_expr.db:
+        parts.append(str(table_expr.db))
+
+    if table_expr.name:
+        parts.append(str(table_expr.name))
+
+    return ".".join(parts)
+
+
+def get_select_alias_map(select_exprs):
+    """
+    For subquery:
+    SELECT issue AS issue_key, label AS s_label FROM vw_label
+
+    returns:
+    issue_key -> issue
+    s_label   -> label
+    """
+    alias_map = {}
+
+    for select_expr in select_exprs:
+        alias = select_expr.alias
+        base_expr = select_expr.this if isinstance(select_expr, exp.Alias) else select_expr
+
+        if isinstance(base_expr, exp.Column):
+            source_col = base_expr.name
+        else:
+            source_col = expr_to_sql(base_expr)
+
+        if alias:
+            alias_map[normalize_name(alias)] = source_col
+        elif isinstance(base_expr, exp.Column):
+            alias_map[normalize_name(base_expr.name)] = base_expr.name
+
+    return alias_map
+
+
+def get_subquery_alias_map(parsed):
+    """
+    Resolves simple subquery aliases.
+
+    Example:
+    LEFT JOIN (
+        SELECT issue AS issue_key, label AS s_label
+        FROM dp_jira_vew.vw_label
+    ) lbl
+
+    Output:
+    LBL.S_LABEL   -> dp_jira_vew.vw_label.label
+    LBL.ISSUE_KEY -> dp_jira_vew.vw_label.issue
+    """
+    result = {}
+
+    if parsed is None:
+        return result
+
+    for subquery in parsed.find_all(exp.Subquery):
+        sub_alias = subquery.alias
+        if not sub_alias:
+            continue
+
+        sub_select = subquery.this.find(exp.Select) if subquery.this else None
+        if sub_select is None:
+            continue
+
+        sub_tables = list(subquery.find_all(exp.Table))
+        if not sub_tables:
+            continue
+
+        # Resolve simple subqueries with one main table
+        physical_table = get_clean_table_name(sub_tables[0])
+
+        sub_select_exprs = list(sub_select.expressions)
+        alias_to_source_col = get_select_alias_map(sub_select_exprs)
+
+        for alias_col, source_col in alias_to_source_col.items():
+            result[f"{normalize_name(sub_alias)}.{alias_col}"] = f"{physical_table}.{source_col}"
+
+    return result
+
+
+def get_table_alias_map(parsed):
+    alias_map = {}
+
+    if parsed is None:
+        return alias_map
+
+    for table in parsed.find_all(exp.Table):
+        clean_table = get_clean_table_name(table)
+
+        alias = table.alias
+        if alias:
+            alias_map[normalize_name(alias)] = clean_table
+
+        real_name = table.name
+        if real_name:
+            alias_map[normalize_name(real_name)] = clean_table
+
+    return alias_map
+
+
+# =====================================================
+# SQL SELECT EXTRACTION
+# =====================================================
+def get_select_expressions(parsed):
+    if parsed is None:
+        return []
+
+    select = parsed.find(exp.Select)
+    if select is None:
+        return []
+
+    return list(select.expressions)
+
+
+def get_output_alias(select_expr, position):
+    alias = select_expr.alias
+
+    if alias:
+        return alias
+
+    base_expr = select_expr.this if isinstance(select_expr, exp.Alias) else select_expr
+
+    if isinstance(base_expr, exp.Column):
+        return base_expr.name
+
+    return f"SELECT_COL_{position}"
+
+
+def extract_source_columns(select_expr, alias_map, subquery_alias_map):
+    source_cols = []
+    source_tables = []
+
+    for col in select_expr.find_all(exp.Column):
+        col_name = col.name
+        table_alias = col.table
+
+        if table_alias:
+            alias_key = normalize_name(table_alias)
+            subquery_key = f"{alias_key}.{normalize_name(col_name)}"
+
+            # Resolve subquery column first
+            if subquery_key in subquery_alias_map:
+                full_col = subquery_alias_map[subquery_key]
+                physical_table = ".".join(full_col.split(".")[:-1])
+            else:
+                actual_table = alias_map.get(alias_key, table_alias)
+                full_col = f"{actual_table}.{col_name}"
+                physical_table = actual_table
+
+            source_cols.append(full_col)
+            source_tables.append(physical_table)
+        else:
+            source_cols.append(col_name)
+
+    return unique_keep_order(source_cols), unique_keep_order(source_tables)
+
+
+def split_schema_table_column(full_col):
+    full_col = str(full_col)
+
+    # Remove any remaining alias junk
+    full_col = re.sub(r"\s+AS\s+\w+", "", full_col, flags=re.IGNORECASE)
+
+    full_col = full_col.replace('"', "")
+    full_col = full_col.replace("`", "")
+    full_col = full_col.replace("[", "").replace("]", "")
+
+    parts = [p.strip() for p in full_col.split(".") if p.strip()]
+
+    if len(parts) >= 4:
+        return parts[-3], parts[-2], parts[-1]
+
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+
+    if len(parts) == 2:
+        return "", parts[0], parts[1]
+
+    if len(parts) == 1:
+        return "", "", parts[0]
+
+    return "", "", ""
+
+
+def get_mapping_type(select_expr, dialect=None):
+    expr_sql = expr_to_sql(select_expr)
+    base_expr = select_expr.this if isinstance(select_expr, exp.Alias) else select_expr
+
+    has_case = base_expr.find(exp.Case) is not None
+    has_agg = re.search(r"\b(SUM|COUNT|AVG|MIN|MAX)\s*\(", expr_sql, flags=re.IGNORECASE)
+    has_func = re.search(
+        r"\b(CONCAT|CAST|TRIM|SUBSTR|SUBSTRING|UPPER|LOWER|COALESCE|NVL|ROUND|DATE|TRUNC|TO_CHAR)\s*\(",
+        expr_sql,
+        flags=re.IGNORECASE
+    )
+
+    if isinstance(base_expr, exp.Column):
+        return "Direct"
+
+    if has_case and has_agg:
+        return "Case + Aggregation"
+
+    if has_case:
+        return "Case"
+
+    if base_expr.find(exp.Subquery):
+        return "Subquery"
+
+    if has_agg:
+        return "Aggregation"
+
+    if has_func:
+        return "Function"
+
+    if any(op in expr_sql for op in ["+", "-", "*", "/"]):
+        return "Calculation"
+
+    return "Expression"
+
+
+def get_confidence(mapping_type, source_cols, match_method):
+    if not source_cols:
+        return "Low"
+
+    if match_method in ["Alias Match", "Direct Column Name Match"]:
+        return "High"
+
+    if match_method in ["Regex Alias Match"]:
+        return "Medium"
+
+    if match_method in ["Position Fallback", "Regex Position Match"]:
+        return "Medium"
+
+    return "Medium"
+
+
+def get_manual_review_flag(confidence, mapping_type, match_method, source_cols):
+    if not source_cols:
+        return "Yes"
+
+    # Strong matches are trusted even for CASE / Aggregation
+    if match_method in ["Alias Match", "Direct Column Name Match"] and confidence == "High":
+        return "No"
+
+    # Regex alias match is acceptable but keep review
+    if match_method == "Regex Alias Match":
+        return "Yes"
+
+    # Position-based mappings need review
+    if match_method in ["Position Fallback", "Regex Position Match"]:
+        return "Yes"
+
+    if mapping_type in ["Not Mapped"]:
+        return "Yes"
+
+    return "Yes"
+
+
+# =====================================================
+# BUILD SQL SELECT MAP
+# =====================================================
+def build_query_mapping(sql, datasource):
+    sql = preprocess_sql(sql)
+    parsed, used_dialect = parse_sql(sql, datasource)
+
+    if parsed is None:
+        return {
+            "parse_status": "Failed",
+            "parse_error": "Unable to parse SQL",
+            "used_dialect": used_dialect,
+            "select_mappings": []
+        }
+
+    alias_map = get_table_alias_map(parsed)
+    subquery_alias_map = get_subquery_alias_map(parsed)
+    select_exprs = get_select_expressions(parsed)
+
+    mappings = []
+
+    for idx, select_expr in enumerate(select_exprs, start=1):
+        select_expression = expr_to_sql(select_expr)
+        sql_output_column = get_output_alias(select_expr, idx)
+
+        source_cols, source_tables = extract_source_columns(
+            select_expr=select_expr,
+            alias_map=alias_map,
+            subquery_alias_map=subquery_alias_map
+        )
+
+        mapping_type = get_mapping_type(select_expr)
+
+        schemas = []
+        tables = []
+        columns = []
+
+        for full_col in source_cols:
+            schema, table, column = split_schema_table_column(full_col)
+            schemas.append(schema)
+            tables.append(table)
+            columns.append(column)
+
+        mappings.append({
+            "select_position_from_sql": idx,
+            "sql_output_column": sql_output_column,
+            "sql_output_column_normalized": normalize_name(sql_output_column),
+            "select_expression": select_expression,
+            "actual_source_columns": ", ".join(source_cols),
+            "actual_source_tables": ", ".join(unique_keep_order(source_tables)),
+            "actual_schema": ", ".join(unique_keep_order(schemas)),
+            "actual_table": ", ".join(unique_keep_order(tables)),
+            "actual_column": ", ".join(unique_keep_order(columns)),
+            "mapping_type": mapping_type
+        })
+
+    return {
+        "parse_status": "Success",
+        "parse_error": "",
+        "used_dialect": used_dialect,
+        "select_mappings": mappings
+    }
+
+
+def find_best_mapping(mstr_column_name, position, mappings):
+    target = normalize_name(mstr_column_name)
+
+    # 1. Alias/output column match
+    alias_matches = [
+        m for m in mappings
+        if m["sql_output_column_normalized"] == target
+    ]
+
+    if len(alias_matches) == 1:
+        return alias_matches[0], "Alias Match"
+
+    if len(alias_matches) > 1:
+        return alias_matches[0], "Multiple Alias Match - Review"
+
+    # 2. Direct source column name match
+    direct_matches = []
+
+    for m in mappings:
+        actual_cols = [
+            normalize_name(x.strip())
+            for x in m["actual_column"].split(",")
+            if x.strip()
+        ]
+
+        if target in actual_cols:
+            direct_matches.append(m)
+
+    if len(direct_matches) == 1:
+        return direct_matches[0], "Direct Column Name Match"
+
+    if len(direct_matches) > 1:
+        return direct_matches[0], "Multiple Source Column Match - Review"
+
+    # 3. Position fallback
+    for m in mappings:
+        if m["select_position_from_sql"] == position:
+            return m, "Position Fallback"
+
+    return None, "No Match"
+
+
+def decide_final_source_columns(source_cols):
+    if source_cols:
+        return source_cols
+    return ""
+
+# =====================================================
+# V6 REGEX FALLBACK
+# =====================================================
+def split_select_items_regex(select_part):
+    items = []
+    current = []
+    depth = 0
+    in_single = False
+    in_double = False
+
+    for ch in select_part:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "(" and not in_single and not in_double:
+            depth += 1
+        elif ch == ")" and not in_single and not in_double:
+            depth -= 1
+
+        if ch == "," and depth == 0 and not in_single and not in_double:
+            items.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+
+    if current:
+        items.append("".join(current).strip())
+
+    return items
+
+
+def extract_select_part_regex(sql):
+    m = re.search(r"\bselect\b(.*?)\bfrom\b", sql, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+
+    return m.group(1).strip()
+
+
+def get_alias_from_select_item(item, position):
+    # col AS alias
+    m = re.search(r"\s+as\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", item, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    # expression alias, example: concat(a,b) issue_num
+    m = re.search(r"\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", item)
+    if m:
+        possible_alias = m.group(1)
+        if "." not in possible_alias and ")" in item:
+            return possible_alias
+
+    # direct column
+    m = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", item)
+    if m:
+        return m.group(1)
+
+    return f"SELECT_COL_{position}"
+
+
+def extract_source_cols_regex(select_item):
+    # alias.column pattern
+    cols = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b",
+        select_item
+    )
+    return [f"{a}.{c}" for a, c in cols]
+
+
+def build_regex_fallback_mapping(sql):
+    select_part = extract_select_part_regex(sql)
+    if not select_part:
+        return []
+
+    select_items = split_select_items_regex(select_part)
+    mappings = []
+
+    for idx, item in enumerate(select_items, start=1):
+        alias = get_alias_from_select_item(item, idx)
+        source_cols = extract_source_cols_regex(item)
+
+        mappings.append({
+            "select_position_from_sql": idx,
+            "sql_output_column": alias,
+            "sql_output_column_normalized": normalize_name(alias),
+            "select_expression": item,
+            "actual_source_columns": ", ".join(unique_keep_order(source_cols)),
+            "actual_source_tables": "",
+            "actual_schema": "",
+            "actual_table": "",
+            "actual_column": ", ".join(
+                unique_keep_order([c.split(".")[-1] for c in source_cols])
+            ),
+            "mapping_type": "Regex Fallback",
+        })
+
+    return mappings
+
+
+def apply_regex_fallback(row, sql):
+    fallback_mappings = build_regex_fallback_mapping(sql)
+
+    if not fallback_mappings:
+        return None, "Regex Fallback Failed"
+
+    target = normalize_name(row[COL_COLUMN_NAME])
+    position = row.get("excel_column_position", "")
+
+    # alias match first
+    for m in fallback_mappings:
+        if m["sql_output_column_normalized"] == target:
+            return m, "Regex Alias Match"
+
+    # position fallback second
+    for m in fallback_mappings:
+        if m["select_position_from_sql"] == position:
+            return m, "Regex Position Match"
+
+    return None, "Regex No Match"
+
+
+# =====================================================
+# MAIN
+# =====================================================
+df = pd.read_excel(INPUT_FILE)
+df.columns = [c.strip() for c in df.columns]
+
+required_cols = [
+    COL_PROJECT_NAME,
+    COL_PROJECT_ID,
+    COL_OBJECT_ID,
+    COL_COLUMN_NAME,
+    COL_COLUMN_ID,
+    COL_SQL_QUERY,
+    COL_DATASOURCE
+]
+
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns in input Excel: {missing}")
+
+df[COL_SQL_QUERY] = df[COL_SQL_QUERY].apply(preprocess_sql)
+df[COL_COLUMN_NAME] = df[COL_COLUMN_NAME].apply(clean_text)
+df[COL_COLUMN_ID] = df[COL_COLUMN_ID].apply(clean_text)
+df[COL_DATASOURCE] = df[COL_DATASOURCE].apply(clean_text)
+
+# Position only within each logical table
+df["excel_column_position"] = df.groupby(GROUP_COLUMNS).cumcount() + 1
+
+query_cache = {}
+output_rows = []
+
+for _, row in df.iterrows():
+    sql = row[COL_SQL_QUERY]
+    datasource = row[COL_DATASOURCE]
+    position = row["excel_column_position"]
+    mstr_column_name = row[COL_COLUMN_NAME]
+
+    cache_key = (
+        row[COL_PROJECT_ID],
+        row[COL_OBJECT_ID],
+        datasource,
+        sql
+    )
+
+    if cache_key not in query_cache:
+        query_cache[cache_key] = build_query_mapping(sql, datasource)
+
+    query_result = query_cache[cache_key]
+    mappings = query_result["select_mappings"]
+
+    matched_mapping, match_method = find_best_mapping(
+        mstr_column_name=mstr_column_name,
+        position=position,
+        mappings=mappings
+    )
+
+    base_row = row.to_dict()
+
+    if matched_mapping:
+        mapping_type = matched_mapping["mapping_type"]
+        source_cols = matched_mapping["actual_source_columns"]
+        source_cols_list = [x.strip() for x in source_cols.split(",") if x.strip()]
+
+        confidence = get_confidence(mapping_type, source_cols_list, match_method)
+
+        manual_review = get_manual_review_flag(
+            confidence=confidence,
+            mapping_type=mapping_type,
+            match_method=match_method,
+            source_cols=source_cols_list
+        )
+
+        if "Review" in match_method:
+            confidence = "Low"
+            manual_review = "Yes"
+
+        final_row = {
+            **base_row,
+            "used_dialect": query_result.get("used_dialect", ""),
+            "match_method": match_method,
+            "parse_status": query_result["parse_status"],
+            "parse_error": query_result["parse_error"],
+            **matched_mapping,
+            "confidence": confidence,
+            "manual_review_flag": manual_review,
+            "final_source_columns": decide_final_source_columns(source_cols),
+            "final_schema": matched_mapping["actual_schema"],
+            "final_table": matched_mapping["actual_table"],
+            "final_column": matched_mapping["actual_column"]
+        }
+
+    else:
+        fallback_mapping, fallback_method = apply_regex_fallback(row, sql)
+
+        if fallback_mapping:
+            source_cols = fallback_mapping["actual_source_columns"]
+            source_cols_list = [x.strip() for x in source_cols.split(",") if x.strip()]
+
+            final_row = {
+                **base_row,
+                "used_dialect": query_result.get("used_dialect", ""),
+                "match_method": fallback_method,
+                "parse_status": query_result["parse_status"],
+                "parse_error": query_result["parse_error"],
+                **fallback_mapping,
+                "confidence": "Medium" if source_cols_list else "Low",
+                "manual_review_flag": "Yes",
+                "final_source_columns": source_cols,
+                "final_schema": fallback_mapping["actual_schema"],
+                "final_table": fallback_mapping["actual_table"],
+                "final_column": fallback_mapping["actual_column"]
+            }
+
+        else:
+            final_row = {
+                **base_row,
+                "used_dialect": query_result.get("used_dialect", ""),
+                "match_method": match_method,
+                "parse_status": query_result["parse_status"],
+                "parse_error": query_result["parse_error"] or "No matching SELECT expression found",
+                "select_position_from_sql": "",
+                "sql_output_column": "",
+                "sql_output_column_normalized": "",
+                "select_expression": "",
+                "actual_source_columns": "",
+                "actual_source_tables": "",
+                "actual_schema": "",
+                "actual_table": "",
+                "actual_column": "",
+                "mapping_type": "Not Mapped",
+                "confidence": "Low",
+                "manual_review_flag": "Yes",
+                "final_source_columns": "",
+                "final_schema": "",
+                "final_table": "",
+                "final_column": ""
+            }
+    output_rows.append(final_row)
+
+out_df = pd.DataFrame(output_rows)
+
+# =====================================================
+# V8 AI REVIEW - ONLY MANUAL REVIEW ROWS
+# =====================================================
+import os
+import json
+from openai import OpenAI
+
+ENABLE_AI = True # change False if network blocks OpenAI
+AI_MAX_ROWS = 10 # first test with 10/50, then increase
+AI_MODEL = "gpt-4.1-mini"
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def safe_json_loads(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        text = text.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+
+
+def ai_review_lineage(row):
+    prompt = f"""
+You are a SQL column-level lineage expert.
+
+Goal:
+Return final physical lineage for one MicroStrategy logical table column.
+
+Rules:
+1. Use only columns visible in SQL or parser output.
+2. Do not invent schema/table/column.
+3. Resolve aliases to physical schema.table.column.
+4. For CASE expressions:
+   - Include value column.
+   - Include filter/condition column only if it controls the value.
+5. If parser output is already correct, keep it.
+6. Return comma-separated values if multiple physical columns exist.
+7. Return JSON only.
+
+JSON format:
+{{
+  "ai_suggested_schema": "",
+  "ai_suggested_table": "",
+  "ai_suggested_column": "",
+  "ai_final_source_columns": "",
+  "ai_reason": "",
+  "ai_confidence": "High"
+}}
+
+Input:
+columnName: {row.get(COL_COLUMN_NAME, "")}
+Datasource: {row.get(COL_DATASOURCE, "")}
+match_method: {row.get("match_method", "")}
+mapping_type: {row.get("mapping_type", "")}
+select_expression: {row.get("select_expression", "")}
+
+Parser Output:
+actual_source_columns: {row.get("actual_source_columns", "")}
+actual_schema: {row.get("actual_schema", "")}
+actual_table: {row.get("actual_table", "")}
+actual_column: {row.get("actual_column", "")}
+
+Full SQL:
+{row.get(COL_SQL_QUERY, "")}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": "Return only valid JSON. No markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0
+        )
+
+        content = response.choices[0].message.content.strip()
+        return safe_json_loads(content)
+
+    except Exception as e:
+        return {
+            "ai_suggested_schema": "",
+            "ai_suggested_table": "",
+            "ai_suggested_column": "",
+            "ai_final_source_columns": "",
+            "ai_reason": f"AI review failed: {repr(e)}",
+            "ai_confidence": "Low"
+        }
+
+
+# Create AI columns if missing
+for col in [
+    "ai_suggested_schema",
+    "ai_suggested_table",
+    "ai_suggested_column",
+    "ai_final_source_columns",
+    "ai_reason",
+    "ai_confidence"
+]:
+    if col not in out_df.columns:
+        out_df[col] = ""
+
+
+if ENABLE_AI:
+    review_indexes = out_df[
+    (out_df["manual_review_flag"] == "Yes") &
+    (out_df["parse_status"] == "Success")
+    ].index.tolist()
+
+    # Start small for safety
+    review_indexes = review_indexes[:AI_MAX_ROWS]
+
+    for idx in review_indexes:
+        row = out_df.loc[idx]
+        ai_result = ai_review_lineage(row)
+
+        out_df.at[idx, "ai_suggested_schema"] = ai_result.get("ai_suggested_schema", "")
+        out_df.at[idx, "ai_suggested_table"] = ai_result.get("ai_suggested_table", "")
+        out_df.at[idx, "ai_suggested_column"] = ai_result.get("ai_suggested_column", "")
+        out_df.at[idx, "ai_final_source_columns"] = ai_result.get("ai_final_source_columns", "")
+        out_df.at[idx, "ai_reason"] = ai_result.get("ai_reason", "")
+        out_df.at[idx, "ai_confidence"] = ai_result.get("ai_confidence", "Low")
+
+            # ✅ Handle CONSTANT columns (AI detects no source column)
+        if (
+            not ai_result.get("ai_suggested_column")
+            and "constant" in ai_result.get("ai_reason", "").lower()
+        ):
+            out_df.at[idx, "final_schema"] = ""
+            out_df.at[idx, "final_table"] = ""
+            out_df.at[idx, "final_column"] = "CONSTANT_VALUE"
+            out_df.at[idx, "final_source_columns"] = "CONSTANT_VALUE"
+            out_df.at[idx, "manual_review_flag"] = "No"
+
+        # If AI gives a final answer, update final lineage
+        if ai_result.get("ai_suggested_column"):
+            out_df.at[idx, "final_schema"] = ai_result.get("ai_suggested_schema", "")
+            out_df.at[idx, "final_table"] = ai_result.get("ai_suggested_table", "")
+            out_df.at[idx, "final_column"] = ai_result.get("ai_suggested_column", "")
+            out_df.at[idx, "final_source_columns"] = ai_result.get("ai_final_source_columns", "")
+
+            if ai_result.get("ai_confidence") in ["High", "Medium"]:
+                out_df.at[idx, "manual_review_flag"] = "AI Reviewed"
+
+final_cols = [
+    COL_PROJECT_NAME,
+    COL_PROJECT_ID,
+    COL_OBJECT_ID,
+    COL_COLUMN_NAME,
+    COL_COLUMN_ID,
+    COL_DATASOURCE,
+    "used_dialect",
+    "excel_column_position",
+    "match_method",
+    "select_position_from_sql",
+    "sql_output_column",
+    "select_expression",
+    "actual_source_columns",
+    "actual_source_tables",
+    "actual_schema",
+    "actual_table",
+    "actual_column",
+    "mapping_type",
+    "confidence",
+    "manual_review_flag",
+    "ai_suggested_schema",
+    "ai_suggested_table",
+    "ai_suggested_column",
+    "ai_final_source_columns",
+    "ai_reason",
+    "ai_confidence",
+    "final_source_columns",
+    "final_schema",
+    "final_table",
+    "final_column",
+    "parse_status",
+    "parse_error",
+    COL_SQL_QUERY
+]
+
+remaining_cols = [c for c in out_df.columns if c not in final_cols]
+out_df = out_df[final_cols + remaining_cols]
+
+out_df.to_excel(OUTPUT_FILE, index=False)
+
+print("SQL lineage extraction completed.")
+print(f"Output file created: {OUTPUT_FILE}")
